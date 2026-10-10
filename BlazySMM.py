@@ -12,12 +12,14 @@ import time
 from html import escape
 from os.path import exists
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 try:
     import tg_bot.CBT as CBT
 except Exception:
     CBT = None
 NAME = 'Blazy SMM'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 DESCRIPTION = 'Blazy SMM — автоматизация SMM-заказов FunPay через BlazySMM.'
 CREDITS = '@tinechelovec'
 DEV = '@tinechelovec'
@@ -51,6 +53,8 @@ PLUGIN_UPDATE_URL = os.getenv('BLAZYSMM_PLUGIN_UPDATE_URL', '').strip()
 BACKUP_DIR = os.path.join(STORAGE_DIR, 'backups')
 _UPDATE_CACHE = {}
 _AUTO_LOT_FLOW = {}
+AUTO_TICKET_SUPPORT = 'https://support.funpay.com'
+AUTO_TICKET_BATCH = 100
 REMIND_AFTER = 15 * 60
 EXPIRE_AFTER = 12 * 60 * 60
 STATUS_RU = {'Completed': 'выполнен', 'Partial': 'частично выполнен', 'Canceled': 'отменён', 'Cancelled': 'отменён', 'In progress': 'в работе', 'Processing': 'обрабатывается', 'Pending': 'в очереди', 'Refilling': 'выполняется рефил', 'Awaiting': 'ожидает запуска', 'Unknown': 'статус неизвестен'}
@@ -125,7 +129,7 @@ def _balance_failure(cardinal, data, order, lot_id, sid):
         _audit('refund', order=oid, success=ok)
         _notify_admins(cardinal, data, f'Возврат #{oid}: ' + ('выполнен' if ok else f'не подтверждён: {error}'), 'refund')
     _save(data)
-_NOTIFY_LABELS = {'new': 'Новый заказ — получена оплата и запрошены данные', 'started': 'Запуск — SMM вернул номер заказа', 'error': 'Ошибки — API, баланс и обработка заказов', 'bonus': 'Бонус — результат выдачи за отзыв', 'refund': 'Возврат — результат возврата оплаты', 'lot': 'Лоты — автоматическое снятие с продажи'}
+_NOTIFY_LABELS = {'new': 'Новый заказ — получена оплата и запрошены данные', 'started': 'Запуск — SMM вернул номер заказа', 'error': 'Ошибки — API, баланс и обработка заказов', 'ticket': 'Авто-тикеты — результат автоматической отправки', 'bonus': 'Бонус — результат выдачи за отзыв', 'refund': 'Возврат — результат возврата оплаты', 'lot': 'Лоты — автоматическое снятие с продажи'}
 def _bonus_panel(data):
     cfg = data['settings']
     text = f"🎁 <b>Бонус за отзыв</b>\n\nСостояние: {('ВКЛ' if cfg['bonus_on'] else 'ВЫКЛ')}\nМинимальная оценка: {cfg['bonus_stars']}★\nУслуга BlazySMM: {escape(str(cfg['bonus_sid'] or 'не задана'))}\nКоличество: {cfg['bonus_qty']}\n\nПосле подходящего отзыва бот запрашивает ссылку и выдаёт бонус один раз. Оценка повторно проверяется перед выдачей. Проверка отзывов — в течение 14 дней после запуска."
@@ -144,7 +148,7 @@ def _extra_callback(cardinal, c, data, bit):
     def show(text, kb):
         _safe_edit(bot, chat, c.message.id, text, kb)
     def wizard(mode, prompt, **values):
-        parent = 'bonus' if mode.startswith('bonus_') else 'ban' if mode.startswith('ban_') else 'lot_settings'
+        parent = 'auto_tickets' if mode.startswith('auto_ticket_') else 'bonus' if mode.startswith('bonus_') else 'ban' if mode.startswith('ban_') else 'lot_settings'
         _WIZARDS[key] = {'mode': mode, 'return': parent, **values}
         tg.set_state(chat, c.message.id, user, 'bzl_wizard')
         bot.send_message(chat, prompt, reply_markup=_return_kb(parent, '❌ Отмена'))
@@ -160,11 +164,44 @@ def _extra_callback(cardinal, c, data, bit):
             setting = 'notify_' + name
             data['settings'][setting] = not data['settings'].get(setting, True)
             _save(data)
-        labels = {'new': '🛒 Новый заказ', 'started': '🚀 Запуск', 'error': '⚠️ Ошибки', 'bonus': '🎁 Бонус', 'refund': '💸 Возврат', 'lot': '🛒 Лоты'}
+        labels = {'new': '🛒 Новый заказ', 'started': '🚀 Запуск', 'error': '⚠️ Ошибки', 'ticket': '🎫 Авто-тикеты', 'bonus': '🎁 Бонус', 'refund': '💸 Возврат', 'lot': '🛒 Лоты'}
         buttons = [(('✅ ' if data['settings'].get('notify_' + name, True) else '➖ ') + label, PREFIX + 'notify:' + name) for name, label in labels.items()]
         rows = [[button] for button in buttons]
         rows.append([('◀️ Назад', PREFIX + 'plugin_settings')])
         show('🔔 <b>Уведомления продавцу</b>\n\nПриходят в Telegram-чаты, где открывали панель плагина. Нажмите кнопку, чтобы переключить событие.\n\n' + '\n'.join(('• ' + escape(label) for label in _NOTIFY_LABELS.values())), _kb(rows))
+    elif bit == 'auto_tickets':
+        show(_auto_ticket_text(data), _auto_ticket_kb(data))
+    elif bit == 'auto_ticket_toggle':
+        cfg = data.setdefault('settings', {})
+        cfg['auto_ticket_enabled'] = not bool(cfg.get('auto_ticket_enabled'))
+        if cfg['auto_ticket_enabled']:
+            cfg['auto_ticket_last_check'] = 0
+            cfg['auto_ticket_last_send'] = 0
+        _save(data)
+        show(_auto_ticket_text(data), _auto_ticket_kb(data))
+    elif bit == 'auto_ticket_check_cd':
+        wizard('auto_ticket_check_cd', 'Введите КД проверки статусов SMM в минутах: от 1 до 10080.')
+    elif bit == 'auto_ticket_send_cd':
+        wizard('auto_ticket_send_cd', 'Введите КД отправки тикетов в минутах: от 1 до 10080.')
+    elif bit == 'auto_ticket_check_now':
+        if not data.setdefault('settings', {}).get('auto_ticket_enabled'):
+            show('🎫 <b>Авто-тикеты выключены.</b>\n\nСначала включите функцию.', _auto_ticket_kb(data))
+        else:
+            result = _auto_ticket_refresh(cardinal, data, force=True)
+            _save(data)
+            show(f"🎫 <b>Проверка завершена</b>\n\nПроверено заказов: <b>{result.get('checked', 0)}</b>\nГотовы к тикету: <b>{len(_auto_ticket_ready_rows(data))}</b>\nОшибок API: <b>{result.get('errors', 0)}</b>", _auto_ticket_kb(data))
+    elif bit == 'auto_ticket_send_now':
+        if not data.setdefault('settings', {}).get('auto_ticket_enabled'):
+            show('🎫 <b>Авто-тикеты выключены.</b>\n\nСначала включите функцию.', _auto_ticket_kb(data))
+        else:
+            _auto_ticket_refresh(cardinal, data, force=True)
+            result = _auto_ticket_send(cardinal, data, force=True)
+            _save(data)
+            errors = result.get('errors') or []
+            note = f"🎫 <b>Отправка завершена</b>\n\nЗаказов отправлено: <b>{result.get('sent', 0)}</b>\nТикетов создано: <b>{result.get('tickets', 0)}</b>"
+            if errors:
+                note += '\n\n⚠️ ' + escape('; '.join(errors[:3]))
+            show(note, _auto_ticket_kb(data))
     elif bit.startswith('toggle:'):
         name = bit.split(':', 1)[1]
         name = {'lc': 'link_confirm_enabled', 'sc': 'status_command_enabled'}.get(name, name)
@@ -280,13 +317,13 @@ def _validated_config(raw):
             if not isinstance(value, dict):
                 raise ValueError('settings должен быть объектом')
             clean = {}
-            bools = {'plugin_enabled', 'auto_refund', 'auto_deactivate', 'bonus_on', 'link_confirm_enabled', 'status_command_enabled'} | {'notify_' + n for n in _NOTIFY_LABELS}
+            bools = {'plugin_enabled', 'auto_refund', 'auto_deactivate', 'bonus_on', 'link_confirm_enabled', 'status_command_enabled', 'auto_ticket_enabled'} | {'notify_' + n for n in _NOTIFY_LABELS}
             for key, item in value.items():
                 if key in bools:
                     if type(item) is not bool:
                         raise ValueError('Нужен true/false: ' + key)
-                elif key in ('bonus_stars', 'bonus_qty'):
-                    if type(item) is not int or item < 1 or (key == 'bonus_stars' and item > 5):
+                elif key in ('bonus_stars', 'bonus_qty', 'auto_ticket_check_minutes', 'auto_ticket_send_minutes'):
+                    if type(item) is not int or item < 1 or (key == 'bonus_stars' and item > 5) or (key.startswith('auto_ticket_') and item > 10080):
                         raise ValueError('Неверное число: ' + key)
                 elif key in ('bonus_sid', 'tpl_ask', 'tpl_done', 'tpl_err'):
                     if not isinstance(item, str) or len(item) > 1500:
@@ -381,6 +418,17 @@ def _wizard_message(cardinal, m):
         else:
             data['blacklist'] = [x for x in data['blacklist'] if x.casefold() != raw.casefold()]
         note = '✅ Чёрный список обновлён.'
+    elif mode in ('auto_ticket_check_cd', 'auto_ticket_send_cd'):
+        if not re.fullmatch(r'\d{1,5}', raw):
+            bot.send_message(m.chat.id, 'Нужно целое число минут от 1 до 10080.')
+            return
+        value = int(raw)
+        if not 1 <= value <= 10080:
+            bot.send_message(m.chat.id, 'Нужно число от 1 до 10080 минут.')
+            return
+        setting = 'auto_ticket_check_minutes' if mode == 'auto_ticket_check_cd' else 'auto_ticket_send_minutes'
+        data.setdefault('settings', {})[setting] = value
+        note = f"✅ {'КД проверки' if mode == 'auto_ticket_check_cd' else 'КД отправки'}: {value} мин."
     else:
         if not re.fullmatch('[1-9][0-9]{0,11}', raw):
             bot.send_message(m.chat.id, 'Нужно целое положительное число (до 12 цифр).')
@@ -727,7 +775,12 @@ def _load() -> dict:
     settings.setdefault('auto_deactivate', False)
     settings.setdefault('link_confirm_enabled', True)
     settings.setdefault('status_command_enabled', True)
-    for kind in ('new', 'started', 'error', 'bonus', 'refund', 'lot'):
+    settings.setdefault('auto_ticket_enabled', False)
+    settings.setdefault('auto_ticket_check_minutes', 10)
+    settings.setdefault('auto_ticket_send_minutes', 60)
+    settings.setdefault('auto_ticket_last_check', 0)
+    settings.setdefault('auto_ticket_last_send', 0)
+    for kind in ('new', 'started', 'error', 'ticket', 'bonus', 'refund', 'lot'):
         settings.setdefault('notify_' + kind, True)
     settings.setdefault('bonus_on', False)
     settings.setdefault('bonus_sid', '')
@@ -774,6 +827,218 @@ def _api_request(data: dict, action: str, **params) -> dict:
     if r.status_code >= 400:
         return {'ok': False, 'error': f'HTTP {r.status_code}', 'raw': payload}
     return {'ok': True, 'raw': payload}
+def _auto_ticket_extract_phpsessid(account) -> str:
+    session = requests.Session()
+    if getattr(account, 'user_agent', None):
+        session.headers['User-Agent'] = account.user_agent
+    timeout = int(getattr(account, 'requests_timeout', 20) or 20)
+    golden_key = str(getattr(account, 'golden_key', '') or '')
+    if not golden_key:
+        raise RuntimeError('golden_key отсутствует')
+    response = session.get('https://funpay.com/support/sso?return_to=%2Ftickets%2Fnew', headers={'cookie': f'golden_key={golden_key}; cookie_prefs=1'}, allow_redirects=False, timeout=timeout)
+    if response.status_code not in (301, 302, 303, 307, 308):
+        raise RuntimeError(f'SSO FunPay вернул HTTP {response.status_code}')
+    location = str(response.headers.get('Location') or '')
+    if not location:
+        raise RuntimeError('SSO не вернул адрес авторизации')
+    if not location.startswith('http'):
+        location = urljoin('https://funpay.com', location)
+    response = session.get(location, allow_redirects=False, timeout=timeout)
+    for source in (response.cookies, session.cookies):
+        for cookie in source:
+            if cookie.name == 'PHPSESSID' and cookie.value:
+                return str(cookie.value)
+    raise RuntimeError('PHPSESSID поддержки не получен')
+
+class _AutoTicketSupportAPI:
+    def __init__(self, account):
+        self.account = account
+        self.session = requests.Session()
+        if getattr(account, 'user_agent', None):
+            self.session.headers['User-Agent'] = account.user_agent
+        self.phpsessid = ''
+        self.csrf_token = ''
+    @property
+    def timeout(self):
+        return int(getattr(self.account, 'requests_timeout', 20) or 20)
+    def _request(self, method, url, *, headers=None, data=None):
+        merged = {'cookie': f'PHPSESSID={self.phpsessid}'}
+        merged.update(headers or {})
+        response = self.session.request(method, url, headers=merged, data=data or {}, allow_redirects=False, timeout=self.timeout)
+        if response.is_redirect or response.status_code in (401, 403):
+            raise RuntimeError('сессия поддержки FunPay недействительна')
+        if response.status_code >= 500:
+            raise RuntimeError(f'support.funpay.com вернул HTTP {response.status_code}')
+        return response
+    def initialize(self):
+        self.phpsessid = _auto_ticket_extract_phpsessid(self.account)
+        response = self._request('GET', AUTO_TICKET_SUPPORT + '/')
+        soup = BeautifulSoup(response.text, 'html.parser')
+        body = soup.find('body')
+        raw = body.get('data-app-config') if body else None
+        if not raw:
+            raise RuntimeError('не найден data-app-config поддержки FunPay')
+        try:
+            app_data = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError('не удалось разобрать конфигурацию поддержки FunPay') from exc
+        self.csrf_token = str(app_data.get('csrfToken') or '')
+        if not self.csrf_token:
+            raise RuntimeError('csrfToken поддержки FunPay отсутствует')
+        return self
+    def _ticket_token(self):
+        response = self._request('GET', AUTO_TICKET_SUPPORT + '/tickets/new/1', headers={'X-CSRF-Token': self.csrf_token, 'Referer': AUTO_TICKET_SUPPORT + '/'})
+        soup = BeautifulSoup(response.text, 'html.parser')
+        token = soup.find('input', attrs={'name': 'ticket[_token]'})
+        if token is None or not token.get('value'):
+            raise RuntimeError('ticket[_token] не найден')
+        return str(token['value'])
+    def create_ticket(self, order_ids, comment):
+        ids = [str(x).lstrip('#') for x in order_ids if str(x).strip()]
+        if not ids:
+            raise RuntimeError('список заказов для тикета пуст')
+        token = self._ticket_token()
+        body_html = escape(str(comment), quote=False).replace('\n', '<br>')
+        payload = {'ticket[fields][1]': str(getattr(self.account, 'username', '') or ''), 'ticket[fields][2]': ', '.join(ids), 'ticket[fields][3]': '2', 'ticket[fields][5]': '201', 'ticket[comment][body_html]': f'<p>{body_html}</p>', 'ticket[comment][attachments]': '', 'ticket[_token]': token}
+        response = self._request('POST', AUTO_TICKET_SUPPORT + '/tickets/create/1', headers={'Origin': AUTO_TICKET_SUPPORT, 'Referer': AUTO_TICKET_SUPPORT + '/tickets/new/1', 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest'}, data=payload)
+        try:
+            return response.json()
+        except Exception as exc:
+            raise RuntimeError(f'поддержка вернула не JSON, HTTP {response.status_code}') from exc
+    def close(self):
+        self.session.close()
+
+def _auto_ticket_success(response: dict) -> tuple[bool, str]:
+    if not isinstance(response, dict):
+        return (False, 'неизвестный ответ поддержки')
+    if response.get('error'):
+        return (False, str(response.get('error')))
+    action = response.get('action')
+    if isinstance(action, dict):
+        message = str(action.get('message') or '')
+        url = str(action.get('url') or '')
+        if 'заявка отправлена' in message.lower() or '/tickets/' in url:
+            return (True, url or message or 'тикет создан')
+    return (False, 'неожиданный ответ support.funpay.com')
+
+def _auto_ticket_status_complete(values, expected: int) -> bool:
+    cleaned = [str(x or '').strip().casefold() for x in values or []]
+    return expected > 0 and len(cleaned) == expected and all(x == 'completed' for x in cleaned)
+
+def _auto_ticket_ready_rows(data: dict):
+    rows = []
+    for oid, row in (data.get('orders') or {}).items():
+        if not isinstance(row, dict) or row.get('refunded') or row.get('auto_ticket_sent_at'):
+            continue
+        ids = [x.strip() for x in str(row.get('site_order') or '').split(',') if x.strip()]
+        if not ids:
+            continue
+        if _auto_ticket_status_complete(row.get('auto_ticket_statuses'), len(ids)):
+            rows.append((str(oid), row))
+    return sorted(rows, key=lambda item: float((item[1] or {}).get('ts') or 0))
+
+def _auto_ticket_refresh(cardinal, data: dict, force: bool=False) -> dict:
+    cfg = data.setdefault('settings', {})
+    if not cfg.get('auto_ticket_enabled') and not force:
+        return {'checked': 0, 'completed': 0, 'errors': 0, 'changed': False}
+    now = time.time()
+    cooldown = max(1, _int(cfg.get('auto_ticket_check_minutes'), 10)) * 60
+    if not force and now - float(cfg.get('auto_ticket_last_check') or 0) < cooldown:
+        return {'checked': 0, 'completed': len(_auto_ticket_ready_rows(data)), 'errors': 0, 'changed': False}
+    checked = completed = errors = 0
+    for oid, row in sorted((data.get('orders') or {}).items(), key=lambda item: float((item[1] or {}).get('auto_ticket_checked_at') or 0)):
+        if not isinstance(row, dict) or row.get('refunded') or row.get('auto_ticket_sent_at'):
+            continue
+        ids = [x.strip() for x in str(row.get('site_order') or '').split(',') if x.strip()]
+        if not ids:
+            continue
+        statuses = []
+        failed = False
+        for site_id in ids:
+            got = _api(data, 'status', order=site_id)
+            if not got.get('ok'):
+                errors += 1
+                failed = True
+                _audit('auto_ticket_status_failed', order=oid, site_order=site_id, error=str(got.get('error') or '')[:180])
+                break
+            statuses.append(str((got.get('raw') or {}).get('status') or 'Unknown'))
+        if failed:
+            row['auto_ticket_checked_at'] = now
+            continue
+        row['auto_ticket_statuses'] = statuses
+        row['auto_ticket_checked_at'] = now
+        checked += 1
+        if _auto_ticket_status_complete(statuses, len(ids)):
+            completed += 1
+    cfg['auto_ticket_last_check'] = now
+    _audit('auto_ticket_check', checked=checked, completed=completed, errors=errors)
+    return {'checked': checked, 'completed': completed, 'errors': errors, 'changed': True}
+
+def _auto_ticket_send(cardinal, data: dict, force: bool=False) -> dict:
+    cfg = data.setdefault('settings', {})
+    if not cfg.get('auto_ticket_enabled') and not force:
+        return {'sent': 0, 'tickets': 0, 'errors': ['авто-тикеты выключены'], 'changed': False}
+    now = time.time()
+    cooldown = max(1, _int(cfg.get('auto_ticket_send_minutes'), 60)) * 60
+    if not force and now - float(cfg.get('auto_ticket_last_send') or 0) < cooldown:
+        return {'sent': 0, 'tickets': 0, 'errors': [], 'changed': False}
+    rows = _auto_ticket_ready_rows(data)
+    cfg['auto_ticket_last_send'] = now
+    if not rows:
+        _audit('auto_ticket_send_skipped', reason='no_completed_orders')
+        return {'sent': 0, 'tickets': 0, 'errors': [], 'changed': True}
+    api = _AutoTicketSupportAPI(cardinal.account)
+    sent = tickets = 0
+    errors = []
+    try:
+        api.initialize()
+        for offset in range(0, len(rows), AUTO_TICKET_BATCH):
+            batch = rows[offset:offset + AUTO_TICKET_BATCH]
+            ids = [oid for oid, _ in batch]
+            username = str(getattr(cardinal.account, 'username', '') or '')
+            listed = ', '.join('#' + oid for oid in ids)
+            comment = f'Здравствуйте!\n\nПрошу подтвердить выполнение следующих заказов. Связанные SMM-заказы выполнены сервисом:\n{listed}\n\nЗаранее благодарю.\nС уважением, {username}.'
+            try:
+                response = api.create_ticket(ids, comment)
+                ok, detail = _auto_ticket_success(response)
+            except Exception as exc:
+                ok, detail = (False, str(exc)[:300])
+            if not ok:
+                errors.append(detail)
+                _audit('auto_ticket_failed', orders=ids, error=detail)
+                break
+            sent_at = int(time.time())
+            for oid, row in batch:
+                row['auto_ticket_sent_at'] = sent_at
+                row['auto_ticket_result'] = detail
+            sent += len(batch)
+            tickets += 1
+            _audit('auto_ticket_sent', orders=ids, ticket=detail)
+            if offset + AUTO_TICKET_BATCH < len(rows):
+                time.sleep(2)
+    except Exception as exc:
+        errors.append(str(exc)[:300])
+        _audit('auto_ticket_auth_failed', error=type(exc).__name__, detail=str(exc)[:180])
+    finally:
+        api.close()
+    return {'sent': sent, 'tickets': tickets, 'errors': errors, 'changed': True}
+
+def _auto_ticket_tick(cardinal, data: dict) -> tuple[list[str], bool]:
+    cfg = data.setdefault('settings', {})
+    if not cfg.get('plugin_enabled', True) or not cfg.get('auto_ticket_enabled'):
+        return ([], False)
+    notes = []
+    changed = False
+    checked = _auto_ticket_refresh(cardinal, data)
+    changed = changed or checked.get('changed', False)
+    sent = _auto_ticket_send(cardinal, data)
+    changed = changed or sent.get('changed', False)
+    if sent.get('sent'):
+        _notify_admins(cardinal, data, f"🎫 Авто-тикеты: отправлено заказов {sent['sent']}, тикетов {sent['tickets']}.", 'ticket')
+    elif sent.get('errors'):
+        _notify_admins(cardinal, data, '🎫 Авто-тикеты: ошибка отправки: ' + '; '.join(sent['errors'][:3]), 'ticket')
+    return (notes, changed)
+
 def _hash_lines(text: str) -> list[str]:
     out = []
     for line in str(text or '').splitlines():
@@ -822,9 +1087,19 @@ def _plugin_settings_text(data):
     cfg = data.get('settings', {})
     badge = lambda name: '✅ вкл' if cfg.get(name) else '➖ выкл'
     state = '🟢 Работает' if cfg.get('plugin_enabled', True) else '🔴 Остановлен'
-    return f"⚙️ <b>Настройки плагина</b>\n{state}\n\n💸 Автовозврат: <b>{badge('auto_refund')}</b>\n⏸ Автодеактивация: <b>{badge('auto_deactivate')}</b>\n🎁 Бонус за отзыв: <b>{badge('bonus_on')}</b> · от {cfg.get('bonus_stars', 5)}★\n🛡 Чёрный список: <b>{len(data.get('blacklist', []))}</b>"
+    return f"⚙️ <b>Настройки плагина</b>\n{state}\n\n💸 Автовозврат: <b>{badge('auto_refund')}</b>\n⏸ Автодеактивация: <b>{badge('auto_deactivate')}</b>\n🎫 Авто-тикеты: <b>{badge('auto_ticket_enabled')}</b>\n🎁 Бонус за отзыв: <b>{badge('bonus_on')}</b> · от {cfg.get('bonus_stars', 5)}★\n🛡 Чёрный список: <b>{len(data.get('blacklist', []))}</b>"
 def _plugin_settings_kb():
-    return _kb([[('🟢 Состояние', PREFIX + 'state')], [('📦 Заказы', PREFIX + 'order_settings')], [('🔔 Уведомления', PREFIX + 'notifications')], [('🎁 Бонус за отзыв', PREFIX + 'bonus')], [('🛡 Чёрный список', PREFIX + 'ban')], [('🧰 Обслуживание', PREFIX + 'maintenance')], [('◀️ К настройкам', PREFIX + 'settings')]])
+    return _kb([[('🟢 Состояние', PREFIX + 'state')], [('📦 Заказы', PREFIX + 'order_settings')], [('🔔 Уведомления', PREFIX + 'notifications')], [('🎫 Авто-тикеты', PREFIX + 'auto_tickets')], [('🎁 Бонус за отзыв', PREFIX + 'bonus')], [('🛡 Чёрный список', PREFIX + 'ban')], [('🧰 Обслуживание', PREFIX + 'maintenance')], [('◀️ К настройкам', PREFIX + 'settings')]])
+def _auto_ticket_text(data: dict) -> str:
+    cfg = data.setdefault('settings', {})
+    enabled = bool(cfg.get('auto_ticket_enabled'))
+    ready = len(_auto_ticket_ready_rows(data))
+    last_check = _fmt_when(cfg.get('auto_ticket_last_check') or 0) if cfg.get('auto_ticket_last_check') else 'ещё не было'
+    last_send = _fmt_when(cfg.get('auto_ticket_last_send') or 0) if cfg.get('auto_ticket_last_send') else 'ещё не было'
+    return f"🎫 <b>Авто-тикеты</b>\n\nСостояние: <b>{('✅ ВКЛ' if enabled else '➖ ВЫКЛ')}</b>\n🔎 КД проверки SMM: <b>{cfg.get('auto_ticket_check_minutes', 10)} мин.</b>\n📨 КД отправки тикетов: <b>{cfg.get('auto_ticket_send_minutes', 60)} мин.</b>\n✅ Сейчас готовы к тикету: <b>{ready}</b>\n🕒 Последняя проверка: <b>{last_check}</b>\n🕒 Последняя отправка: <b>{last_send}</b>\n\nВ тикет попадают только заказы FunPay, созданные этим плагином, у которых <b>все</b> связанные SMM-заказы получили статус <code>Completed</code>. Повторно один и тот же FunPay-заказ не отправляется."
+def _auto_ticket_kb(data: dict):
+    cfg = data.setdefault('settings', {})
+    return _kb([[('🔴 Выключить' if cfg.get('auto_ticket_enabled') else '🟢 Включить', PREFIX + 'auto_ticket_toggle')], [(f"🔎 Проверка: {cfg.get('auto_ticket_check_minutes', 10)} мин.", PREFIX + 'auto_ticket_check_cd')], [(f"📨 Отправка: {cfg.get('auto_ticket_send_minutes', 60)} мин.", PREFIX + 'auto_ticket_send_cd')], [('🔄 Проверить сейчас', PREFIX + 'auto_ticket_check_now')], [('📨 Отправить сейчас', PREFIX + 'auto_ticket_send_now')], [('◀️ Назад', PREFIX + 'plugin_settings')]])
 def _order_settings_text(data: dict) -> str:
     cfg = data['settings']
     confirm_state = '✅ ВКЛ' if cfg.get('link_confirm_enabled', True) else '➖ ВЫКЛ'
@@ -1748,7 +2023,9 @@ def _remember(cardinal) -> None:
                             sends.append((chat, text))
                     extra_fp, notes, extra_changed = _sweep(cardinal_ref, data)
                     sends.extend(extra_fp)
-                    if changed or extra_changed:
+                    ticket_notes, ticket_changed = _auto_ticket_tick(cardinal_ref, data)
+                    notes.extend(ticket_notes)
+                    if changed or extra_changed or ticket_changed:
                         _save(data)
                     for chat, text in sends:
                         _send_fp(cardinal_ref, chat, text)
