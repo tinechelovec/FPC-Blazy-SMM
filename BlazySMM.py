@@ -19,7 +19,7 @@ try:
 except Exception:
     CBT = None
 NAME = 'Blazy SMM'
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 DESCRIPTION = 'Blazy SMM — автоматизация SMM-заказов FunPay через BlazySMM.'
 CREDITS = '@tinechelovec'
 DEV = '@tinechelovec'
@@ -813,20 +813,60 @@ def _api_request(data: dict, action: str, **params) -> dict:
         if v is None or v == '':
             continue
         body[k] = v
-    try:
-        r = requests.post(f'{url}/api/v2', json=body, timeout=45)
-        payload = r.json()
-    except Exception as e:
-        return {'ok': False, 'error': f'Сайт не ответил: {e}'}
-    if isinstance(payload, list):
+    endpoint = f'{url}/api/v2'
+    safe_retry = action not in ('add',)
+    attempts = 3 if safe_retry else 1
+    last_error = ''
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.post(endpoint, json=body, headers={'Accept': 'application/json'}, timeout=(15, 45))
+        except requests.RequestException as e:
+            last_error = f'Ошибка соединения с BlazySMM: {type(e).__name__}: {e}'
+            _audit('api_transport_error', action=action, attempt=attempt, attempts=attempts, error=type(e).__name__)
+            if attempt < attempts:
+                time.sleep(attempt * 2)
+                continue
+            return {'ok': False, 'error': last_error}
+        content_type = str(r.headers.get('Content-Type') or '')
+        raw_text = str(r.text or '')
+        if not raw_text.strip():
+            last_error = f'BlazySMM вернул пустой ответ (HTTP {r.status_code})'
+            _audit('api_invalid_response', action=action, attempt=attempt, attempts=attempts, status=r.status_code, content_type=content_type, body='empty')
+            if safe_retry and attempt < attempts:
+                time.sleep(attempt * 2)
+                continue
+            return {'ok': False, 'error': last_error}
+        try:
+            payload = r.json()
+        except ValueError:
+            snippet = re.sub(r'\s+', ' ', raw_text).strip()[:300]
+            snippet = re.sub(r'bz_[A-Za-z0-9_-]+', '[API KEY]', snippet)
+            last_error = f'BlazySMM вернул не JSON (HTTP {r.status_code})'
+            _audit('api_invalid_response', action=action, attempt=attempt, attempts=attempts, status=r.status_code, content_type=content_type, body=snippet)
+            if safe_retry and attempt < attempts:
+                time.sleep(attempt * 2)
+                continue
+            return {'ok': False, 'error': last_error}
+        if r.status_code >= 500 or r.status_code == 429:
+            message = str(payload.get('error') or f'HTTP {r.status_code}') if isinstance(payload, dict) else f'HTTP {r.status_code}'
+            last_error = message
+            _audit('api_http_retry', action=action, attempt=attempt, attempts=attempts, status=r.status_code)
+            if safe_retry and attempt < attempts:
+                time.sleep(attempt * 2)
+                continue
+            return {'ok': False, 'error': message, 'raw': payload}
+        if isinstance(payload, list):
+            if r.status_code >= 400:
+                return {'ok': False, 'error': f'HTTP {r.status_code}', 'raw': payload}
+            return {'ok': True, 'raw': payload}
+        if not isinstance(payload, dict):
+            return {'ok': False, 'error': f'BlazySMM вернул неизвестный JSON-формат (HTTP {r.status_code})'}
+        if payload.get('error'):
+            return {'ok': False, 'error': str(payload.get('error')), 'raw': payload}
+        if r.status_code >= 400:
+            return {'ok': False, 'error': f'HTTP {r.status_code}', 'raw': payload}
         return {'ok': True, 'raw': payload}
-    if not isinstance(payload, dict):
-        return {'ok': False, 'error': 'Сайт ответил не JSON'}
-    if payload.get('error'):
-        return {'ok': False, 'error': str(payload.get('error')), 'raw': payload}
-    if r.status_code >= 400:
-        return {'ok': False, 'error': f'HTTP {r.status_code}', 'raw': payload}
-    return {'ok': True, 'raw': payload}
+    return {'ok': False, 'error': last_error or 'BlazySMM временно недоступен'}
 def _auto_ticket_extract_phpsessid(account) -> str:
     session = requests.Session()
     if getattr(account, 'user_agent', None):
